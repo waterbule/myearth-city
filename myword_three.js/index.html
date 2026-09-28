@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>myearth2.3</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        /* echarts弹窗*/
+        #chart-panel {
+            position: absolute;
+            display: none;
+            width: 380px;
+            height: 300px;
+            background: rgba(15, 25, 45, 0.92);
+            border: 1px solid #00d8ff;
+            border-radius: 8px;
+            box-shadow: 0 0 20px rgba(0, 216, 255, 0.45);
+            z-index: 10;
+            padding: 8px;
+            box-sizing: border-box;
+        }
+
+        #chart-panel .chart-title {
+            color: #00d8ff;
+            font-family: 'Microsoft YaHei', sans-serif;
+            font-size: 13px;
+            margin: 0 0 4px 6px;
+        }
+
+        .chart-tabs {
+            display: flex;
+            border-bottom: 1px solid #1d3346;
+            margin: 0 6px 6px;
+        }
+
+        .chart-tabs .tab {
+            background: transparent;
+            border: none;
+            color: #9ec3d6;
+            font-size: 11px;
+            padding: 3px 12px;
+            cursor: pointer;
+            font-family: inherit;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+        }
+
+        .chart-tabs .tab.active {
+            color: #00d8ff;
+            border-bottom-color: #00d8ff;
+        }
+
+        #chart-container {
+            width: 100%;
+            height: calc(100% - 56px);
+        }
+
+        #chart-panel .close-btn {
+            position: absolute;
+            top: 4px;
+            right: 8px;
+            color: #00d8ff;
+            cursor: pointer;
+            font-size: 16px;
+            user-select: none;
+        }
+
+        #hint {
+            position: absolute;
+            bottom: 12px;
+            left: 12px;
+            color: #888;
+            font-family: 'Microsoft YaHei', sans-serif;
+            font-size: 12px;
+        }
+    </style>
+    <!-- echartscdn -->
+    <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
+    <!-- threejs模块映射 -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.module.js",
+                "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/controls/OrbitControls.js"
+            }
+        }
+    </script>
+</head>
+
+<body>
+    <div id="chart-panel">
+        <div class="chart-title" id="chart-title">楼栋人流</div>
+        <span class="close-btn" id="close-btn">×</span>
+        <div class="chart-tabs">
+            <button class="tab active" data-range="day">今日（24小时）</button>
+            <button class="tab" data-range="week">本周（7天）</button>
+            <button class="tab" data-range="month">本月（30天）</button>
+        </div>
+        <div id="chart-container"></div>
+    </div>
+    
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+
+        // scene
+        // 1.1 场景 / 相机 / 渲染器
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x05060a); // 深空黑
+
+        const camera = new THREE.PerspectiveCamera(
+            50,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            2000
+        );
+        camera.position.set(0, 1.5, 5.2); // 临时位置，后面会按城市方向重新对齐
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // 轨道控制器
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 2.4;     // 最近不能穿到地球内部
+        controls.maxDistance = 20;
+
+        // 光照：环境光 和一束平行光（模拟太阳）
+        scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+        const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+        sun.position.set(5, 3, 5);
+        scene.add(sun);
+
+        // 1.2 地球（带贴图 和自转）
+        const earthRadius = 2;
+        const earthGeo = new THREE.SphereGeometry(earthRadius, 64, 64);
+
+        // 默认蓝色海洋色，贴图加载成功后自动覆盖
+        const earthMat = new THREE.MeshPhongMaterial({
+            color: 0x2a5fa3,
+            shininess: 10
+        });
+
+        const texLoader = new THREE.TextureLoader();
+        // 贴图
+        texLoader.load(
+            'asserts/earth.jpg',
+            (tex) => {
+                earthMat.map = tex;
+                earthMat.color.set(0xffffff);
+                earthMat.needsUpdate = true;
+            },
+            undefined,
+            (err) => console.warn('地球贴图加载失败，现在是未知的海洋星球！', err)
+        );
+
+        // 用一个组包住地球，方便后续让城市跟随地球一起自转
+        const earthGroup = new THREE.Group();
+        const earth = new THREE.Mesh(earthGeo, earthMat);
+        earthGroup.add(earth);
+        scene.add(earthGroup);
+
+        // 1.3 星空粒子背景
+        function createStarField(count = 3000) {
+            const geo = new THREE.BufferGeometry();
+            const positions = new Float32Array(count * 3);
+            for (let i = 0; i < count; i++) {
+                // 球面均匀分布的随机方向
+                const r = 200 + Math.random() * 600;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                positions[i * 3]     = r * Math.sin(phi) * Math.cos(theta);
+                positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                positions[i * 3 + 2] = r * Math.cos(phi);
+            }
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            const mat = new THREE.PointsMaterial({
+                color: 0xffffff,
+                size: 1.2,
+                sizeAttenuation: true,
+                transparent: true,
+                opacity: 0.9
+            });
+            return new THREE.Points(geo, mat);
+        }
+        const stars = createStarField();
+        scene.add(stars);
+
+        // cityGroup楼栋（程序化生成 和 球面贴合  和全球分布）
+        const cityGroup = new THREE.Group(); // 仅作容器
+        earthGroup.add(cityGroup); // 跟随地球自转
+
+        // 经纬度 转换为三维坐标（球面上）
+        function latLonToVector3(lat, lon, radius) {
+            const phi = (90 - lat) * Math.PI / 180;
+            const theta = (lon + 180) * Math.PI / 180;
+            return new THREE.Vector3(
+                -radius * Math.sin(phi) * Math.cos(theta),
+                 radius * Math.cos(phi),
+                 radius * Math.sin(phi) * Math.sin(theta)
+            );
+        }
+
+        const up = new THREE.Vector3(0, 1, 0);
+
+        // 相机初始位置：正对地球
+        camera.position.set(0, 1.2, 5.5);
+        controls.target.set(0, 0, 0);
+        controls.update();
+
+        // 楼栋类型库（按权重抽取，名称/颜色/高度范围）
+        const buildingTypes = [
+            { name: '住宅',   color: 0x6b8cae, hRange: [0.10, 0.18], weight: 30 },
+            { name: '写字楼', color: 0x4a6fa5, hRange: [0.18, 0.30], weight: 15 },
+            { name: '商场',   color: 0xff7a59, hRange: [0.08, 0.15], weight: 8  },
+            { name: '医院',   color: 0xeeeeee, hRange: [0.12, 0.22], weight: 6  },
+            { name: '学校',   color: 0xa3e635, hRange: [0.08, 0.14], weight: 6  },
+            { name: 'CBD',    color: 0x00d8ff, hRange: [0.28, 0.46], weight: 5  },
+            { name: '餐厅',   color: 0xfbbf24, hRange: [0.06, 0.12], weight: 10 },
+            { name: '公园',   color: 0x4ade80, hRange: [0.03, 0.05], weight: 5  }
+        ];
+
+        function weightedPick(arr) {
+            const total = arr.reduce((s, t) => s + t.weight, 0);
+            let r = Math.random() * total;
+            for (const t of arr) {
+                r -= t.weight;
+                if (r <= 0) return t;
+            }
+            return arr[0];
+        }
+
+        const buildings = [];
+        const block = 0.055;       // 楼基础宽度
+
+        // 全球体随机散布楼栋//
+        // 同时形成若干城市集群：先随机若干个簇心，再在簇心周围密集生成楼栋
+        const clusterCount = 12;                 // 全球 12 个"城市"
+        const buildingsPerCluster = 25;          // 每城 25 栋
+        const clusterSpread = 8;                 // 簇内经纬度跨度（度）
+
+        for (let c = 0; c < clusterCount; c++) {
+            // 簇心：纬度避开极地（-65 ~ 65），经度全周
+            const cLat = -65 + Math.random() * 130;
+            const cLon = -180 + Math.random() * 360;
+
+            for (let k = 0; k < buildingsPerCluster; k++) {
+                // 在簇心附近抖动
+                const lat = cLat + (Math.random() - 0.5) * clusterSpread;
+                const lon = cLon + (Math.random() - 0.5) * clusterSpread;
+
+                const type = weightedPick(buildingTypes);
+                const w = block + Math.random() * 0.02;
+                const d = block + Math.random() * 0.02;
+                const h = type.hRange[0] + Math.random() * (type.hRange[1] - type.hRange[0]);
+
+                // 这栋楼在球面上的位置 + 外法线 + 朝向
+                const spherePos = latLonToVector3(lat, lon, earthRadius);
+                const localOutward = spherePos.clone().normalize();
+                const localQuat = new THREE.Quaternion().setFromUnitVectors(up, localOutward);
+
+                const geo = new THREE.BoxGeometry(w, h, d);
+                const mat = new THREE.MeshPhongMaterial({
+                    color: type.color,
+                    emissive: 0x080812,
+                    shininess: 40
+                });
+                const b = new THREE.Mesh(geo, mat);
+                b.position.copy(spherePos).add(localOutward.clone().multiplyScalar(h / 2));
+                b.quaternion.copy(localQuat);
+                b.userData = {
+                    isBuilding: true,
+                    name: type.name,
+                    type: type.name,
+                    id: `b_${c}_${k}`,
+                    seed: c * 1000 + k,
+                    height: h
+                };
+                cityGroup.add(b);
+                buildings.push(b);
+            }
+        }
+
+        console.log(`城市生成完成，共 ${buildings.length} 栋可点击楼栋，分散在 ${clusterCount} 个簇`);
+
+        // raycaster 射线检测 和 ECharts 弹出窗 （点击楼栋时触发）
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const panel = document.getElementById('chart-panel');
+        const chartContainer = document.getElementById('chart-container');
+        const titleEl = document.getElementById('chart-title');
+        let chartInstance = null;
+
+        // 是否暂停地球自转（点击楼栋后暂停，点击图表外区域后恢复）
+        let isPaused = false;
+
+        // 当前展示的楼栋 + 时间范围
+        let currentBuilding = null;
+        let currentRange = 'day';
+
+        // 根据楼栋类型 + 时间范围生成"人流量"数据
+        function generateFlowData(type, range, seed) {
+            let labels, data;
+            // 噪声函数：用 seed 制造稳定的小幅波动
+            const noise = (idx) => 0.85 + ((seed * (idx + 7)) % 30) / 100;
+
+            if (range === 'day') {
+                labels = Array.from({ length: 24 }, (_, h) => `${h}时`);
+                data = labels.map((_, h) => {
+                    let base = 30;
+                    switch (type) {
+                        case '住宅':
+                            if (h >= 7 && h <= 9)        base = 85;   // 早高峰
+                            else if (h >= 18 && h <= 22) base = 95;   // 晚高峰
+                            else if (h <= 5)             base = 10;
+                            else                         base = 40;
+                            break;
+                        case '写字楼':
+                        case 'CBD':
+                            if (h >= 9 && h <= 18)       base = 90;
+                            else if (h >= 19 && h <= 22) base = 25;
+                            else                         base = 5;
+                            break;
+                        case '商场':
+                            if (h >= 10 && h <= 22)      base = 80;
+                            else                         base = 10;
+                            break;
+                        case '医院':
+                            if (h >= 8 && h <= 12)      base = 95;
+                            else if (h >= 14 && h <= 17) base = 70;
+                            else if (h <= 6)            base = 15;
+                            else                        base = 40;
+                            break;
+                        case '学校':
+                            if (h >= 8 && h <= 16)      base = 90;
+                            else if (h >= 17 && h <= 19) base = 50;
+                            else                        base = 5;
+                            break;
+                        case '餐厅':
+                            if (h === 12 || h === 13)   base = 90;
+                            else if (h >= 18 && h <= 21) base = 95;
+                            else if (h <= 9)            base = 5;
+                            else                        base = 30;
+                            break;
+                        case '公园':
+                            if (h >= 8 && h <= 18)      base = 60;
+                            else                        base = 10;
+                            break;
+                    }
+                    return Math.round(base * noise(h));
+                });
+            } else if (range === 'week') {
+                labels = ['周一','周二','周三','周四','周五','周六','周日'];
+                data = labels.map((_, d) => {
+                    // d: 0=周一 ... 5=周六, 6=周日
+                    const isWeekend = (d === 5 || d === 6);
+                    let multiplier = 1;
+                    if (isWeekend) {
+                        switch (type) {
+                            case '住宅':
+                            case '商场':
+                            case '公园':
+                            case '餐厅':
+                                multiplier = 1.4; break;
+                            case '写字楼':
+                            case 'CBD':
+                            case '学校':
+                                multiplier = 0.15; break;
+                            case '医院':
+                                multiplier = 0.6; break;
+                        }
+                    }
+                    const base = 60 + ((seed * (d + 3)) % 30);
+                    return Math.round(base * multiplier * noise(d));
+                });
+            } else { // month
+                labels = Array.from({ length: 30 }, (_, k) => `${k + 1}日`);
+                data = labels.map((_, d) => {
+                    const dow = d % 7; // 模拟周几
+                    const isWeekend = (dow === 5 || dow === 6);
+                    let multiplier = 1;
+                    if (isWeekend) {
+                        multiplier = (type === '写字楼' || type === 'CBD' || type === '学校') ? 0.2 : 1.3;
+                    }
+                    const base = 60 + ((seed + d * 7) % 30);
+                    return Math.round(base * multiplier * noise(d));
+                });
+            }
+            return { labels, data };
+        }
+
+        function renderChart() {
+            if (!currentBuilding || !chartInstance) return;
+            const type = currentBuilding.userData.type;
+            const seed = currentBuilding.userData.seed;
+            const { labels, data } = generateFlowData(type, currentRange, seed);
+            const rangeText = currentRange === 'day' ? '今日人流量'
+                           : currentRange === 'week' ? '本周人流量'
+                           : '本月人流量';
+
+            chartInstance.setOption({
+                backgroundColor: 'transparent',
+                grid: { left: 40, right: 15, top: 22, bottom: 28 },
+                tooltip: { trigger: 'axis' },
+                xAxis: {
+                    type: 'category',
+                    data: labels,
+                    axisLabel: { color: '#9ec3d6', fontSize: 10 },
+                    axisLine: { lineStyle: { color: '#2c4a63' } }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: '人/分钟',
+                    nameTextStyle: { color: '#9ec3d6', fontSize: 10 },
+                    axisLabel: { color: '#9ec3d6', fontSize: 10 },
+                    splitLine: { lineStyle: { color: '#1d3346' } }
+                },
+                series: [{
+                    name: rangeText,
+                    type: 'line',
+                    smooth: true,
+                    data: data,
+                    lineStyle: { color: '#00d8ff', width: 2 },
+                    itemStyle: { color: '#00d8ff' },
+                    areaStyle: {
+                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                            { offset: 0, color: 'rgba(0,216,255,0.45)' },
+                            { offset: 1, color: 'rgba(0,216,255,0.02)' }
+                        ])
+                    }
+                }]
+            }, true);
+        }
+
+        function showChartAt(clientX, clientY, building) {
+            currentBuilding = building;
+            titleEl.textContent = `${building.userData.name} · 人流量分析`;
+
+            const pw = 380, ph = 300;
+            let x = clientX + 12;
+            let y = clientY + 12;
+            if (x + pw > window.innerWidth)  x = clientX - pw - 12;
+            if (y + ph > window.innerHeight) y = clientY - ph - 12;
+            panel.style.left = Math.max(8, x) + 'px';
+            panel.style.top  = Math.max(8, y) + 'px';
+            panel.style.display = 'block';
+
+            if (!chartInstance) {
+                chartInstance = echarts.init(chartContainer);
+            } else {
+                chartInstance.resize();
+            }
+            renderChart();
+        }
+
+        function hideChart() {
+            panel.style.display = 'none';
+            currentBuilding = null;
+            isPaused = false;  // 关闭图表同时恢复自转
+        }
+
+        document.getElementById('close-btn').addEventListener('click', hideChart);
+
+        // tab切换：今日 / 本周 / 本月
+        document.querySelectorAll('.chart-tabs .tab').forEach(tab => {
+            tab.addEventListener('mousedown', (e) => {
+                // 阻止冒泡到 document 的 mousedown，避免 downPos 被设置
+                e.stopPropagation();
+            });
+            tab.addEventListener('mouseup', (e) => {
+                e.stopPropagation();
+            });
+            tab.addEventListener('click', (e) => {
+                e.stopPropagation();
+                document.querySelectorAll('.chart-tabs .tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                currentRange = tab.dataset.range;
+                renderChart();
+            });
+        });
+
+        // 鼠标悬停：检测是否在楼栋上，光标变 pointer
+        renderer.domElement.addEventListener('mousemove', (e) => {
+            mouse.x =  (e.clientX / window.innerWidth)  * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const hits = raycaster.intersectObjects(buildings, true);
+            renderer.domElement.style.cursor = hits.length > 0 ? 'pointer' : 'default';
+        });
+
+        //点击事件：用浏览器原生 click（自动忽略拖拽）
+        document.addEventListener('click', (e) => {
+            // 点在图表弹窗内 -> 不处理（让 tab/关闭按钮自己处理）
+            if (panel.contains(e.target)) return;
+
+            mouse.x =  (e.clientX / window.innerWidth)  * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const hits = raycaster.intersectObjects(buildings, true);
+            console.log('click hits:', hits.length, '/ buildings:', buildings.length);
+
+            if (hits.length > 0) {
+                // 击中楼栋：暂停自转 ，弹出折线图
+                isPaused = true;
+                showChartAt(e.clientX, e.clientY, hits[0].object);
+            } else {
+                // 击中空白处（星空/地球空地），恢复自转 ，关闭图表 
+                hideChart();
+            }
+        });
+
+        // 动画循环
+        function animate() {
+            requestAnimationFrame(animate);
+            // 地球自转（点楼栋查看数据时暂停）
+            if (!isPaused) {
+                earthGroup.rotation.y += 0.0005;  //
+            }
+            // 星空缓慢漂移（始终运行）
+            stars.rotation.y += 0.00003;
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        //窗口自适应
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            if (chartInstance) chartInstance.resize();
+        });
+    </script>
+</body>
+
+</html>
